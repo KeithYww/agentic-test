@@ -1,0 +1,82 @@
+# SPDX-FileCopyrightText: 2025-2026 Taras Paruta (partarstu@gmail.com)
+#
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# ============================================================================
+# Project runtime base image (tag: 0.1).
+#
+# Built once on the ECS host with a real Docker daemon and pushed to ACR:
+#   docker build -t agentic-qa-base:0.1 -f Dockerfile.base .
+#   docker push agentic-qa-base:0.1
+#
+# Content: python runtime + uv + project's locked deps in /app/.venv + the
+# pre-built Dashboard UI at /app/orchestrator/static. Bump the tag (0.1 → 0.2)
+# only when uv.lock or the UI changes; app code changes rebuild Dockerfile.all.
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# Stage 1: runtime — Python + uv + locked deps (installed once here).
+# ---------------------------------------------------------------------------
+FROM docker.m.daocloud.io/library/python:3.14-slim AS runtime
+
+WORKDIR /app
+
+# Install system deps + uv (pinned). Regenerate a clean sources.list because the
+# base image ships a stale "buster" entry that breaks `apt-get update`.
+RUN . /etc/os-release \
+    && printf 'deb http://deb.debian.org/debian %s main\ndeb http://security.debian.org/debian-security %s-security main\ndeb http://deb.debian.org/debian %s-updates main\n' \
+        "$VERSION_CODENAME" "$VERSION_CODENAME" "$VERSION_CODENAME" > /etc/apt/sources.list \
+    && rm -f /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources \
+    && apt-get update && apt-get install -y --no-install-recommends libmagic1 curl \
+    && curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin UV_VERSION=0.12.10 sh \
+    && apt-get purge -y curl && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
+
+ENV UV_LINK_MODE=copy \
+    UV_NO_CACHE=1 \
+    UV_PROJECT_ENVIRONMENT=/app/.venv \
+    PATH="/app/.venv/bin:$PATH"
+
+# Install the shared runtime deps from the lock file (no dev tools, no optional
+# service extras). --active makes uv create/populate the venv even though the
+# project itself is not installed.
+# Materialise the venv as real files (bin/* symlinks replaced, tar -> extract)
+# so the image can be snapshotted by any builder (Kaniko historically dropped
+# uv's symlinked/hardlinked venv, shipping an empty image).
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project --active \
+    && python -c "import a2a, fastapi, httpx; print('base-venv OK: a2a/fastapi/httpx importable')" \
+    && cd "$UV_PROJECT_ENVIRONMENT/bin" && for f in python python3 python3.14; do [ -e "$f" ] && rm -f "$f" && cp /usr/local/bin/python3.14 "$f" && chmod +x "$f"; done \
+    && cd "$UV_PROJECT_ENVIRONMENT" && tar -czf /tmp/venv.tar.gz . && rm -rf ./* && tar -xzf /tmp/venv.tar.gz \
+    && python -c "import a2a, fastapi, httpx; print('base-venv materialised OK')" \
+    || { echo "FAIL: uv built venv did not survive materialisation"; exit 1; }
+
+RUN mkdir -p /app/local_models
+
+# ---------------------------------------------------------------------------
+# Stage 2: build the Dashboard UI (React/Vite) — source stage only.
+# ---------------------------------------------------------------------------
+FROM docker.m.daocloud.io/library/node:20-alpine AS ui-builder
+
+WORKDIR /ui
+
+COPY orchestrator/ui/package*.json ./
+ARG NPM_REGISTRY=https://registry.npmmirror.com/
+RUN npm ci --no-audit --no-fund --registry "$NPM_REGISTRY"
+
+COPY orchestrator/ui/ ./
+RUN npm run build \
+    && test -f /ui/dist/index.html
+
+# ---------------------------------------------------------------------------
+# Stage 3: final image = runtime Python env + the built UI.
+# ---------------------------------------------------------------------------
+FROM runtime
+
+# Dashboard UI bundle → the dir the app serves at /
+COPY --from=ui-builder /ui/dist /app/orchestrator/static
+
+# Branding (repo static/ holds the logo)
+COPY static/ /app/static/
+
+RUN test -f /app/orchestrator/static/index.html \
+    && echo "base image ready: venv + UI at /app/orchestrator/static"

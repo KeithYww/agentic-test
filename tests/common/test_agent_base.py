@@ -1,0 +1,202 @@
+# SPDX-FileCopyrightText: 2025-2026 Taras Paruta (partarstu@gmail.com)
+#
+# SPDX-License-Identifier: AGPL-3.0-only
+
+import logging
+from typing import TYPE_CHECKING
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from a2a.helpers import get_message_text
+from a2a.types import AgentSkill, Message
+from pydantic_ai.messages import ModelResponse, TextPart
+from pydantic_ai.usage import RunUsage
+
+if TYPE_CHECKING:
+    from pydantic_ai.usage import UsageLimits
+
+import config
+from common.agent_base import AgentBase
+from common.agent_log_capture import AgentLogCaptureHandler
+from common.models import JsonSerializableModel
+from common.streaming import reset_current_log_handler, set_current_log_handler
+
+
+class TestAgent(AgentBase):
+    __test__ = False
+
+    def get_thinking_level(self) -> str:
+        return "LOW"
+
+    def get_max_requests_per_task(self) -> int:
+        return 5
+
+    def get_skills(self) -> list[AgentSkill]:
+        return [AgentSkill(id="test-skill", name="Test skill", description="A test skill.", tags=["test"])]
+
+
+class MockOutput(JsonSerializableModel):
+    result: str
+
+
+class _NoSkillsAgent(TestAgent):
+    __test__ = False
+
+    def get_skills(self) -> list[AgentSkill]:
+        return []
+
+
+class _EmptyDescriptionSkillAgent(TestAgent):
+    __test__ = False
+
+    def get_skills(self) -> list[AgentSkill]:
+        return [AgentSkill(id="s", name="Skill", description="", tags=["test"])]
+
+
+@pytest.fixture
+def test_agent_instance():
+    with patch("common.agent_base.Agent"):  # Mock the actual pydantic_ai Agent class
+        agent = TestAgent(
+            agent_name="test-agent",
+            base_url="http://localhost",
+            protocol="http",
+            port=8000,
+            external_port=8000,
+            model_name="openai:test-model",
+            output_type=MockOutput,
+            instructions="test instructions",
+            mcp_servers=[],
+        )
+        return agent
+
+
+def test_agent_initialization(test_agent_instance):
+    assert test_agent_instance.agent_name == "test-agent"
+    assert test_agent_instance.url == "http://localhost:8000"
+    assert test_agent_instance.get_thinking_level() == "LOW"
+
+
+def _construct(agent_cls: type[AgentBase]) -> AgentBase:
+    return agent_cls(
+        agent_name="test-agent",
+        base_url="http://localhost",
+        protocol="http",
+        port=8000,
+        external_port=8000,
+        model_name="openai:test-model",
+        output_type=MockOutput,
+        instructions="test instructions",
+        mcp_servers=[],
+    )
+
+
+def test_agent_card_uses_declared_skills(test_agent_instance):
+    """Agent Card skills must come from get_skills(), not a hardcoded placeholder."""
+    skills = test_agent_instance.get_skills()
+    assert len(skills) == 1
+    assert skills[0].id == "test-skill"
+    assert skills[0].description == "A test skill."
+
+
+def test_get_server_raises_if_no_skills_declared():
+    with patch("common.agent_base.Agent"), pytest.raises(ValueError, match="at least one skill"):
+        _construct(_NoSkillsAgent)
+
+
+def test_get_server_raises_if_skill_has_empty_description():
+    with patch("common.agent_base.Agent"), pytest.raises(ValueError, match="non-empty description"):
+        _construct(_EmptyDescriptionSkillAgent)
+
+
+def test_report_activity_auto_registered(test_agent_instance):
+    """AgentBase with empty tools=() must expose report_activity in its tools list."""
+    assert test_agent_instance.report_activity in test_agent_instance.tools
+
+
+def test_no_extra_tools_added_beyond_report_activity():
+    """When tools=() the resulting list contains exactly report_activity."""
+    with patch("common.agent_base.Agent"):
+        agent = TestAgent(
+            agent_name="test-agent",
+            base_url="http://localhost",
+            protocol="http",
+            port=8000,
+            external_port=8000,
+            model_name="openai:test-model",
+            output_type=MockOutput,
+            instructions="instructions",
+            mcp_servers=[],
+            tools=(),
+        )
+    assert agent.tools == [agent.report_activity]
+
+
+def test_instruction_snippet_appended(test_agent_instance):
+    """The report_activity instruction snippet must be present at the end of instructions."""
+    assert test_agent_instance.instructions.endswith(
+        "\nA `report_activity` tool is available — call it before any other tool call or reasoning phase."
+    )
+
+
+@pytest.mark.asyncio
+async def test_usage_limits_tool_calls_limit_is_doubled(test_agent_instance):
+    """tool_calls_limit must equal get_max_requests_per_task() * 2."""
+    captured: list[UsageLimits] = []
+
+    async def fake_run(request, usage_limits=None, deps=None):
+        captured.append(usage_limits)
+        mock_result = MagicMock()
+        mock_result.output = MockOutput(result="ok")
+        mock_result.usage.return_value = RunUsage(input_tokens=10, output_tokens=5)
+        return mock_result
+
+    test_agent_instance.agent = AsyncMock()
+    test_agent_instance.agent.run = fake_run
+
+    with patch("common.agent_base.get_message_text", return_value="hello"):
+        mock_message = MagicMock(spec=Message)
+        mock_message.parts = []
+        await test_agent_instance.run(mock_message)
+
+    assert len(captured) == 1
+    assert captured[0].tool_calls_limit == test_agent_instance.get_max_requests_per_task() * 2
+    assert captured[0].total_tokens_limit == config.BudgetConfig.TOTAL_TOKENS_LIMIT_PER_TASK
+
+
+@pytest.mark.asyncio
+async def test_agent_run_success(test_agent_instance):
+    mock_run_result = MagicMock()
+    mock_run_result.output = MockOutput(result="success")
+    mock_run_result.usage.return_value = RunUsage(input_tokens=20, output_tokens=8)
+    mock_run_result.all_messages.return_value = [ModelResponse(parts=[TextPart(content="reasoning trace")])]
+
+    # Mock the internal agent's run method
+    test_agent_instance.agent = AsyncMock()
+    test_agent_instance.agent.run.return_value = mock_run_result
+
+    mock_message = MagicMock(spec=Message)
+    # Mocking get_message_text utility call which happens inside _get_all_received_contents
+    with patch("common.agent_base.get_message_text", return_value="hello"):
+        mock_message.parts = []
+
+        response = await test_agent_instance.run(mock_message)
+
+        # Use raw string for regex-like escaping or double escape
+        assert get_message_text(response) == '{"result":"success"}'
+
+    # The run's token usage is captured for the executor to emit as an artifact.
+    assert test_agent_instance.latest_token_usage is not None
+    assert test_agent_instance.latest_token_usage.input_tokens == 20
+    assert test_agent_instance.latest_token_usage.total_tokens == 28
+
+    # The run's (redacted) trace is captured for the executor to emit as an artifact.
+    assert test_agent_instance.latest_trace is not None
+    assert b"reasoning trace" in test_agent_instance.latest_trace
+
+
+@pytest.mark.asyncio
+async def test_activity_queue_bounded_and_drops_items(test_agent_instance):
+    """When the queue hits its max limit, report_activity drops new items without raising."""
+    for i in range(1005):
+        await test_agent_instance.report_activity(f"activity-{i}")
+    assert test_agent_instance.activity_queue.qsize() == 1000

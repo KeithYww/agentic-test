@@ -1,0 +1,85 @@
+# SPDX-FileCopyrightText: 2025-2026 Taras Paruta (partarstu@gmail.com)
+#
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# ============================================================================
+# Application image (all-in-one). Built on the project runtime base image.
+#
+# The base image (agentic-qa-base:0.1) is built on an ECS host with a real
+# Docker daemon and already contains:
+#   - the Python runtime + uv + the project's locked deps in /app/.venv, and
+#   - the pre-built Dashboard UI at /app/orchestrator/static.
+# This image adds business code, Node.js/lark-cli and the freshly built Dashboard.
+# Locked runtime dependencies are reconciled here so an older base cannot ship
+# new application code with missing packages. The base remains a dependency cache.
+#
+# Build & push:
+#   docker build -t agentic-qa:0.1 \
+#     --build-arg BASE_IMAGE=agentic-qa-base:0.1 \
+#     -f Dockerfile.all .
+# ============================================================================
+ARG BASE_IMAGE=agentic-qa-base:latest
+ARG UI_BASE_IMAGE=docker.m.daocloud.io/library/node:20-alpine
+FROM ${UI_BASE_IMAGE} AS ui-builder
+WORKDIR /ui
+COPY orchestrator/ui/package*.json ./
+ARG NPM_REGISTRY=https://registry.npmmirror.com/
+RUN npm ci --no-audit --no-fund --registry "$NPM_REGISTRY"
+COPY orchestrator/ui/ ./
+RUN npm run build
+
+FROM ${BASE_IMAGE}
+
+WORKDIR /app
+
+# Reconcile the inherited venv with this revision before copying application code.
+# Keeping manifests in a separate layer preserves the cache on code-only changes.
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project --active \
+    && python -c "from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter; from opentelemetry.sdk.trace import TracerProvider; print('locked runtime deps OK: OTLP exporter/SDK importable')"
+
+# Node.js + lark-cli, used to create the consolidated test-case report doc in Feishu
+# (common/services/feishu_doc_service.py). curl was purged from the base image after
+# installing uv (Dockerfile.base); reinstalled here because @larksuite/cli's own
+# postinstall script shells out to curl (not wget) to fetch its compiled binary.
+# Node itself is installed from the official release tarball (pinned) rather than
+# Debian's often-stale nodejs package. Arch is read from `uname -m` at build time,
+# not the TARGETARCH build-arg — Kaniko (used by the GitLab build job) doesn't
+# populate it the way `docker buildx` does, so it comes through empty there.
+ARG NODE_VERSION=20.18.1
+RUN if [ "$(node --version 2>/dev/null)" = "v${NODE_VERSION}" ] \
+       && command -v lark-cli >/dev/null && command -v meegle >/dev/null; then \
+      node --version; \
+    else \
+      apt-get update && apt-get install -y --no-install-recommends wget curl && rm -rf /var/lib/apt/lists/* \
+    && NODE_ARCH="$(case "$(uname -m)" in x86_64) echo x64 ;; aarch64) echo arm64 ;; *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;; esac)" \
+    && wget -q "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.gz" \
+      -O /tmp/node.tar.gz \
+    && tar -xzf /tmp/node.tar.gz -C /usr/local --strip-components=1 \
+    && rm /tmp/node.tar.gz \
+    && node --version && npm --version \
+    && npm install -g @larksuite/cli \
+    && lark-cli --version \
+    && npm install -g @lark-project/meegle \
+    && meegle --version; \
+    fi
+
+COPY agents/       /app/agents/
+COPY common/       /app/common/
+COPY orchestrator/ /app/orchestrator/
+COPY scripts/      /app/scripts/
+COPY config.py     /app/config.py
+COPY --from=ui-builder /ui/dist /app/orchestrator/static
+
+ENV PYTHONPATH=/app
+
+# uvicorn is a runtime import for start_all.py but is not a direct dependency of
+# the project (it reaches the venv transitively via pydantic-ai-slim[mcp] in the
+# base image). Pin it here explicitly so the all-in-one entrypoint reliably
+# imports it regardless of base-venv composition.
+RUN uv pip install --python "${UV_PROJECT_ENVIRONMENT:-/app/.venv}/bin/python" 'uvicorn==0.49.0' \
+    && "${UV_PROJECT_ENVIRONMENT:-/app/.venv}/bin/python" -c "import uvicorn; print('all-in-one venv OK: uvicorn', uvicorn.__version__)"
+
+EXPOSE 8000 8001 8002 8003 8004 9010
+
+CMD ["python", "scripts/start_all.py"]

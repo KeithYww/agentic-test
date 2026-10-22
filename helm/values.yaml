@@ -1,0 +1,64 @@
+image:
+  all: agentic-qa
+  feishuMcp: agentic-qa
+  tag: "1.0.0"
+  pullPolicy: IfNotPresent
+
+# Single container runs all services — aggregate resource limits.
+resources:
+  requests:
+    cpu: "1500m"
+    memory: "2Gi"
+  limits:
+    cpu: "3"
+    memory: "5Gi"
+
+serviceType: ClusterIP
+
+# Non-sensitive config — goes into ConfigMap.
+config:
+  # Set only for production; empty hides alarm-card Retry and disables web resume.
+  dashboard_public_url: ""
+  meego_project_key: "example-space"
+  photon_api_base_url: "https://llm.example.com"
+  prompt_injection_check_enabled: "false"
+  log_level: "INFO"
+  feishu_mcp_server_url: "http://localhost:9010/sse"
+  remote_execution_agent_hosts: "http://localhost"
+  agent_discovery_ports: "8001-8004"
+  requirement_review_enabled: "false"
+  oss_archive_enabled: "false"
+  oss_endpoint: ""
+  oss_bucket: ""
+  oss_region: ""
+  kb_base_url: ""
+  kb_query_enabled: "true"
+  tc_repair_max_tokens: "8192"
+  design_max_reviews: "3"
+  design_fix_min_severity: "medium"
+  design_timeout_seconds: "7200"
+  design_token_limit: "1000000"
+  design_model_concurrency: "4"
+  design_context_window: "0"
+  # Empty disables tracing. Points at a self-hosted Langfuse instance's OTLP endpoint, e.g.
+  # http://langfuse-web:3000/api/public/otel (see docker-compose.langfuse.yml).
+  otel_exporter_otlp_endpoint: ""
+
+# Sensitive config — goes into Secret. Override in values.prod.yaml or via --set.
+secrets:
+  oss_access_key_id: ""
+  oss_access_key_secret: ""
+  kb_api_key: ""
+  photon_api_key: ""
+  feishu_app_id: ""
+  feishu_app_secret: ""
+  meego_plugin_id: ""
+  meego_plugin_secret: ""
+  meego_user_key: ""
+  orchestrator_api_key: ""
+  dashboard_username: ""
+  dashboard_password: ""
+  dashboard_jwt_secret: ""
+  feishu_bot_webhook_url: ""
+  # e.g. "Authorization=Basic <base64(public_key:secret_key)>".
+  otel_exporter_otlp_headers: ""

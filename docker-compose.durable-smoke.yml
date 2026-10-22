@@ -1,0 +1,25 @@
+# Overlay for the supported single-process SQLite topology. External boundaries
+# remain the recording smoke services; this is not a real Feishu E2E run.
+services:
+  orchestrator:
+    build:
+      dockerfile: Dockerfile.all
+      args:
+        BASE_IMAGE: agentic-qa-base:latest
+        UI_BASE_IMAGE: node:20-alpine
+    command: ["python", "scripts/start_all.py"]
+    volumes:
+      - qa_design_smoke_state:/app/state
+    environment:
+      DESIGN_STATE_DIR: "/app/state"
+      DESIGN_TOKEN_LIMIT: "6000000"
+      TC_REPAIR_MAX_TOKENS: "32768"
+      KB_BASE_URL: "http://qa_boundary_mock:8096"
+      KB_API_KEY: "smoke-kb"
+      KB_QUERY_ENABLED: "true"
+      JIRA_MCP_SERVER_URL: "http://jira_mcp_mock:9000/sse"
+      FEISHU_MCP_SERVER_URL: "http://feishu_mcp_mock:9010/sse"
+      AGENT_BASE_URL: "http://localhost"
+      REMOTE_EXECUTION_AGENT_HOSTS: "http://localhost,http://incident_creation,http://execution_agent"
+volumes:
+  qa_design_smoke_state:

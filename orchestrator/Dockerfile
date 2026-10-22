@@ -1,0 +1,80 @@
+# SPDX-FileCopyrightText: 2025-2026 Taras Paruta (partarstu@gmail.com)
+#
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# =============================================================================
+# Stage 1: Build the React UI
+# =============================================================================
+FROM node:20-alpine AS ui-builder
+
+WORKDIR /ui
+
+# Copy package files first for better caching
+COPY orchestrator/ui/package*.json ./
+
+# Install dependencies
+RUN npm ci
+
+# Copy source code
+COPY orchestrator/ui/ ./
+
+# Build the production bundle
+RUN npm run build
+
+# =============================================================================
+# Stage 2: Build the final image
+# =============================================================================
+FROM agentic-qa-base:latest
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Create man directories to prevent potential dependency issues with ca-certificates
+RUN mkdir -p /usr/share/man/man1 /usr/share/man/man2 && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends openjdk-25-jre-headless wget unzip curl && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Set the Allure version as an argument
+ARG ALLURE_VERSION=2.34.1
+
+# Define environment variables for Allure
+ENV ALLURE_HOME=/opt/allure-${ALLURE_VERSION}
+ENV PATH="${ALLURE_HOME}/bin:${PATH}"
+
+# Download, extract, and set up Allure Commandline
+RUN wget -q https://github.com/allure-framework/allure2/releases/download/${ALLURE_VERSION}/allure-${ALLURE_VERSION}.zip -O /tmp/allure.zip && \
+    unzip /tmp/allure.zip -d /opt && \
+    rm /tmp/allure.zip
+
+# Verify Allure installation
+RUN allure --version
+RUN mkdir "allure-report"
+
+# Node.js + lark-cli, used to create the consolidated test-case report doc in Feishu
+# (common/services/feishu_doc_service.py). Installed from the official Node.js release
+# tarball (pinned) rather than Debian's often-stale nodejs package. Arch is read from
+# `uname -m` at build time, not the TARGETARCH build-arg — Kaniko-based builds don't
+# populate it the way `docker buildx` does, so it comes through empty there.
+ARG NODE_VERSION=20.18.1
+RUN NODE_ARCH="$(case "$(uname -m)" in x86_64) echo x64 ;; aarch64) echo arm64 ;; *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;; esac)" \
+    && wget -q "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.gz" \
+      -O /tmp/node.tar.gz \
+    && tar -xzf /tmp/node.tar.gz -C /usr/local --strip-components=1 \
+    && rm /tmp/node.tar.gz \
+    && node --version && npm --version \
+    && npm install -g @larksuite/cli \
+    && lark-cli --version
+
+ARG WORK_DIR=/app
+WORKDIR ${WORK_DIR}
+
+# Copy Python application
+COPY orchestrator/ ${WORK_DIR}/orchestrator
+COPY common/ ${WORK_DIR}/common
+COPY scripts/ ${WORK_DIR}/scripts
+COPY config.py ${WORK_DIR}/config.py
+
+# Copy built UI from the ui-builder stage
+COPY --from=ui-builder /ui/dist ${WORK_DIR}/orchestrator/static
+
+CMD ["gunicorn", "-w", "1", "-k", "uvicorn.workers.UvicornWorker", "orchestrator.main:orchestrator_app"]

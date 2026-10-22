@@ -1,0 +1,46 @@
+/.idea
+/.venv/
+agents/orchestrator/test_main.py
+mcp/jira/.env
+*.env
+*.pyc
+/allure-report
+/allure-results/
+/.run
+ GEMINI.md
+/.gemini
+substitutions.yaml
+/local_models/
+test_main.py
+**/node_modules/
+orchestrator/static/
+bandit-report.json
+coverage.xml
+test-results.xml
+.editorconfig
+/logs
+/output/
+
+# Local design verification credentials
+.scratch/design-dev.env
+
+# Local regression requests, receipts and business evidence
+/.scratch/
+
+# Local tooling, runtime data and credentials
+.DS_Store
+.cache/
+.claude/
+midscene_run/
+state/
+*.sqlite
+*.sqlite3
+*.db
+*.pem
+*.key
+.env.*
+!.env.example
+
+.ruff_cache/
+.pytest_cache/
+__pycache__/

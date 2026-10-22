@@ -1,0 +1,159 @@
+# SPDX-FileCopyrightText: 2025-2026 Taras Paruta (partarstu@gmail.com)
+#
+# SPDX-License-Identifier: AGPL-3.0-only
+
+import os
+import shutil
+import subprocess
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+from allure_commons.logger import AllureFileLogger
+from allure_commons.model2 import Attachment, Status, StatusDetails, TestResult, TestStepResult
+
+import config
+from common import utils
+from common.models import TestExecutionResult
+from common.services.test_reporting_client_base import TestReportingClientBase
+
+logger = utils.get_logger(__name__)
+
+
+class AllureClient(TestReportingClientBase):
+    def __init__(self, path: str):
+        if not os.path.exists(path):
+            raise ValueError(f"The provided path does not exist: {path}")
+        self.results_dir = Path(os.path.join(path, config.ALLURE_RESULTS_DIR)).resolve()
+        self.report_dir = Path(os.path.join(path, config.ALLURE_REPORT_DIR)).resolve()
+        os.makedirs(self.results_dir, exist_ok=True)
+        self.file_logger = AllureFileLogger(self.results_dir)
+
+    def generate_report(self, test_execution_results: list[TestExecutionResult]):
+        logger.info("Generating Allure report...")
+        self._clean_directories()
+        for test_execution_result in test_execution_results:
+            self._process_test_execution_result(test_execution_result)
+        self._generate_html()
+        return "Allure report generation initiated."
+
+    def _process_test_execution_result(self, test_execution_result: TestExecutionResult):
+        test_result = TestResult()
+        test_result.name = test_execution_result.testCaseName
+        test_result.uuid = str(uuid.uuid4())
+        test_result.start = self._timestamp_to_millis(
+            test_execution_result.start_timestamp, "test execution start timestamp", fallback_to_now=True
+        )
+
+        # Extract logs from artifacts if available using the common utility
+        logs_list = utils.get_execution_logs_from_artifacts(test_execution_result.artifacts)
+        logs = "\n\n".join(logs_list) if logs_list else None
+
+        # Map test status
+        if test_execution_result.testExecutionStatus == "passed":
+            test_result.status = Status.PASSED
+        elif test_execution_result.testExecutionStatus == "failed":
+            test_result.status = Status.FAILED
+            test_result.statusDetails = StatusDetails(message=test_execution_result.generalErrorMessage, trace=logs)
+        elif test_execution_result.testExecutionStatus == "error":
+            test_result.status = Status.BROKEN
+            test_result.statusDetails = StatusDetails(message=test_execution_result.generalErrorMessage, trace=logs)
+
+        # Add steps
+        for step_result in test_execution_result.stepResults:
+            step = TestStepResult()
+            step.name = step_result.stepDescription
+            step.status = Status.PASSED if step_result.success else Status.FAILED
+            if step_result.success:
+                step.statusDetails = StatusDetails(message=step_result.actualResults)
+            else:
+                step.statusDetails = StatusDetails(message=step_result.errorMessage)
+            if step_result.executionStartTimestamp:
+                step_start = self._timestamp_to_millis(
+                    step_result.executionStartTimestamp, "step execution start timestamp"
+                )
+                if step_start is not None:
+                    step.start = step_start
+            if step_result.executionEndTimestamp:
+                step_stop = self._timestamp_to_millis(step_result.executionEndTimestamp, "step execution end timestamp")
+                if step_stop is not None:
+                    step.stop = step_stop
+            test_result.steps.append(step)
+        test_result.stop = self._timestamp_to_millis(
+            test_execution_result.end_timestamp, "test execution end timestamp", fallback_to_now=True
+        )
+
+        if test_execution_result.artifacts:
+            for artifact in test_execution_result.artifacts:
+                if artifact.raw:
+                    extension = artifact.media_type.split("/")[-1] if artifact.media_type else "bin"
+                    unique_filename = f"{uuid.uuid4()}-attachment.{extension}"
+                    attachment_file_path = self.results_dir / unique_filename
+                    with open(attachment_file_path, "wb") as f:
+                        f.write(artifact.raw)
+                    test_result.attachments.append(
+                        Attachment(name=artifact.name, source=unique_filename, type=artifact.media_type)
+                    )
+        self.file_logger.report_result(test_result)
+
+    @staticmethod
+    def _timestamp_to_millis(timestamp_str: str | None, field_name: str, fallback_to_now: bool = False) -> int | None:
+        timestamp = utils.parse_timestamp(timestamp_str, field_name)
+        if not timestamp:
+            if fallback_to_now:
+                logger.warning(f"Using current time because '{field_name}' could not be parsed.")
+                return int(datetime.now().timestamp() * 1000)
+            return None
+        return int(timestamp.timestamp() * 1000)
+
+    def _generate_html(self):
+        logger.info(f"Generating Allure HTML report in {self.report_dir}...")
+        try:
+            allure_home = os.environ.get("ALLURE_HOME")
+            if allure_home:
+                allure_executable = os.path.join(allure_home, "bin", "allure")
+            else:
+                allure_executable = "allure"
+                logger.warning("ALLURE_HOME environment variable not set. Assuming 'allure' is in the system's PATH.")
+
+            command = [
+                allure_executable,
+                "-v",
+                "generate",
+                "-o",
+                str(self.report_dir),
+                "--clean",
+                "--single-file",
+                str(self.results_dir),
+            ]
+            subprocess.run(command, check=True, capture_output=True, text=True)
+            logger.info("Allure report generated successfully.")
+        except subprocess.CalledProcessError as e:
+            logger.exception("Failed to generate Allure report.")
+            logger.error(f"Stdout: {e.stdout}")
+            logger.error(f"Stderr: {e.stderr}")
+            raise
+        except FileNotFoundError:
+            logger.error(
+                "Allure command not found. Please ensure Allure is installed and ALLURE_HOME is set, "
+                "or that 'allure' is in your PATH."
+            )
+            raise
+
+    def _clean_directories(self):
+        logger.info(f"Cleaning up {self.results_dir} and {self.report_dir} folders before report generation.")
+        if self.results_dir.exists():
+            for item in self.results_dir.iterdir():
+                if item.is_dir():
+                    shutil.rmtree(item)
+                else:
+                    item.unlink()
+            logger.info(f"Cleaned up {self.results_dir}.")
+
+        if self.report_dir.exists():
+            for item in self.report_dir.iterdir():
+                if item.is_dir():
+                    shutil.rmtree(item)
+                else:
+                    item.unlink()
+            logger.info(f"Cleaned up {self.report_dir}.")

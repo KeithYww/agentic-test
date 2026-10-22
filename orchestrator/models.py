@@ -1,0 +1,390 @@
+# SPDX-FileCopyrightText: 2025-2026 Taras Paruta (partarstu@gmail.com)
+#
+# SPDX-License-Identifier: AGPL-3.0-only
+
+"""
+Core data models and state management for the Orchestrator.
+
+This module contains shared data structures used by both the main orchestrator
+logic and the dashboard service, avoiding circular imports.
+"""
+
+import asyncio
+from collections import deque
+from dataclasses import dataclass
+from datetime import datetime
+from enum import StrEnum
+from typing import Any
+
+from a2a.types import AgentCard
+
+
+class AgentStatus(StrEnum):
+    """Status of an agent in the registry."""
+
+    AVAILABLE = "AVAILABLE"
+    BUSY = "BUSY"
+    BROKEN = "BROKEN"
+
+
+class BrokenReason(StrEnum):
+    """Reason why an agent is marked as BROKEN."""
+
+    OFFLINE = "OFFLINE"  # Agent was unreachable (network error, crashed)
+    TASK_STUCK = "TASK_STUCK"  # Agent is reachable but a task timed out or is stuck
+
+
+class TaskStatus(StrEnum):
+    """Status of a task in the history."""
+
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+    PAUSED = "PAUSED"
+
+
+@dataclass
+class TaskRecord:
+    """Record of a task for history tracking."""
+
+    task_id: str
+    agent_id: str
+    agent_name: str
+    description: str
+    status: TaskStatus
+    start_time: datetime
+    end_time: datetime | None = None
+    error_message: str | None = None
+    agent_logs: list[str] | None = None
+    current_activity: str | None = None
+    token_usage: dict[str, Any] | None = None
+    # Human-readable summary of what the agent produced (e.g. generated test cases, review feedback).
+    # Stored here so the dashboard can show output without the full trace.
+    result_summary: str | None = None
+    # Redacted debug trace of the agent's run (JSON string). Deliberately excluded from
+    # to_dict() below — it can be much larger than the rest of the record and is only
+    # needed by the dedicated trace endpoint, not the /api/dashboard/tasks list.
+    trace_json: str | None = None
+
+    @property
+    def duration_ms(self) -> int | None:
+        """Calculate duration in milliseconds."""
+        if self.end_time and self.start_time:
+            return int((self.end_time - self.start_time).total_seconds() * 1000)
+        return None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary for JSON serialization."""
+        return {
+            "task_id": self.task_id,
+            "agent_id": self.agent_id,
+            "agent_name": self.agent_name,
+            "description": self.description,
+            "status": self.status.value,
+            "start_time": self.start_time.isoformat(),
+            "end_time": self.end_time.isoformat() if self.end_time else None,
+            "duration_ms": self.duration_ms,
+            "error_message": self.error_message,
+            "agent_logs": self.agent_logs,
+            "current_activity": self.current_activity,
+            "token_usage": self.token_usage,
+            "result_summary": self.result_summary,
+        }
+
+
+@dataclass
+class ErrorRecord:
+    """Record of an error for history tracking."""
+
+    error_id: str
+    timestamp: datetime
+    message: str
+    task_id: str | None = None
+    agent_id: str | None = None
+    module: str | None = None
+    traceback_snippet: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary for JSON serialization."""
+        return {
+            "error_id": self.error_id,
+            "timestamp": self.timestamp.isoformat(),
+            "message": self.message,
+            "task_id": self.task_id,
+            "agent_id": self.agent_id,
+            "module": self.module,
+            "traceback_snippet": self.traceback_snippet,
+        }
+
+
+class TaskHistory:
+    """Thread-safe ring buffer for task history."""
+
+    def __init__(self, max_size: int = 100):
+        self._tasks: deque[TaskRecord] = deque(maxlen=max_size)
+        self._lock = asyncio.Lock()
+        self._tasks_by_id: dict[str, TaskRecord] = {}
+
+    async def add(self, task: TaskRecord) -> None:
+        """Add a new task record.
+
+        When the ring buffer is at capacity, appending evicts the oldest record from
+        the deque; without this, ``_tasks_by_id`` would grow unbounded (never pruned)
+        for the lifetime of the process.
+        """
+        async with self._lock:
+            evicted = self._tasks[0] if len(self._tasks) == self._tasks.maxlen else None
+            self._tasks.append(task)
+            if evicted is not None:
+                self._tasks_by_id.pop(evicted.task_id, None)
+            self._tasks_by_id[task.task_id] = task
+
+    async def update(
+        self, task_id: str, status: TaskStatus, end_time: datetime | None = None, error_message: str | None = None
+    ) -> None:
+        """Update an existing task record."""
+        async with self._lock:
+            if task_id in self._tasks_by_id:
+                task = self._tasks_by_id[task_id]
+                task.status = status
+                if end_time:
+                    task.end_time = end_time
+                if error_message:
+                    task.error_message = error_message
+
+    async def get_all(self) -> list[TaskRecord]:
+        """Get all task records, newest first."""
+        async with self._lock:
+            return list(reversed(self._tasks))
+
+    async def update_logs(self, task_id: str, logs: list[str]) -> None:
+        """Update task with agent logs."""
+        async with self._lock:
+            if task_id in self._tasks_by_id:
+                task = self._tasks_by_id[task_id]
+                task.agent_logs = logs
+
+    async def update_usage(self, task_id: str, usage: dict[str, Any]) -> None:
+        """Update task with the agent's token usage and estimated cost."""
+        async with self._lock:
+            if task_id in self._tasks_by_id:
+                self._tasks_by_id[task_id].token_usage = usage
+
+    async def update_trace(self, task_id: str, trace_json: str) -> None:
+        """Update task with the agent's redacted debug trace."""
+        async with self._lock:
+            if task_id in self._tasks_by_id:
+                self._tasks_by_id[task_id].trace_json = trace_json
+
+    async def update_result_summary(self, task_id: str, summary: str) -> None:
+        """Store a human-readable summary of what the agent produced."""
+        async with self._lock:
+            if task_id in self._tasks_by_id:
+                self._tasks_by_id[task_id].result_summary = summary
+
+    async def get_by_id(self, task_id: str) -> TaskRecord | None:
+        """Get a specific task by ID."""
+        async with self._lock:
+            return self._tasks_by_id.get(task_id)
+
+    async def set_current_activity(self, task_id: str, text: str) -> None:
+        """Set the live activity text for a running task."""
+        async with self._lock:
+            if task_id in self._tasks_by_id:
+                self._tasks_by_id[task_id].current_activity = text
+
+    async def clear_current_activity(self, task_id: str) -> None:
+        """Clear the activity text when a task reaches a terminal state."""
+        async with self._lock:
+            if task_id in self._tasks_by_id:
+                self._tasks_by_id[task_id].current_activity = None
+
+    async def append_log_batch(self, task_id: str, lines: list[str]) -> None:
+        """Append a batch of streamed log lines to the task's running log buffer."""
+        async with self._lock:
+            if task_id in self._tasks_by_id:
+                task = self._tasks_by_id[task_id]
+                if task.agent_logs is None:
+                    task.agent_logs = []
+                task.agent_logs.extend(lines)
+
+
+class ErrorHistory:
+    """Thread-safe ring buffer for error history."""
+
+    def __init__(self, max_size: int = 50):
+        self._errors: deque[ErrorRecord] = deque(maxlen=max_size)
+        self._lock = asyncio.Lock()
+
+    async def add(self, error: ErrorRecord) -> None:
+        """Add a new error record."""
+        async with self._lock:
+            self._errors.append(error)
+
+    async def get_all(self) -> list[ErrorRecord]:
+        """Get all error records, newest first."""
+        async with self._lock:
+            return list(reversed(self._errors))
+
+    async def get_recent(self, limit: int = 10) -> list[ErrorRecord]:
+        """Get the most recent N errors."""
+        async with self._lock:
+            return list(reversed(list(self._errors)[-limit:]))
+
+
+class AgentRegistry:
+    """Registry for managing agent cards and their statuses."""
+
+    def __init__(self):
+        self._cards: dict[str, AgentCard] = {}
+        self._statuses: dict[str, AgentStatus] = {}
+        self._broken_reasons: dict[str, BrokenReason] = {}
+        self._stuck_task_ids: dict[str, str] = {}  # agent_id -> last stuck task_id
+        self._current_tasks: dict[str, list[str]] = {}  # agent_id -> list of running task_ids
+        self._busy_slots: dict[str, int] = {}  # agent_id -> number of tasks currently running
+        self._lock = asyncio.Lock()
+
+    async def get_card(self, agent_id: str) -> AgentCard | None:
+        async with self._lock:
+            return self._cards.get(agent_id)
+
+    async def get_name(self, agent_id: str) -> str:
+        async with self._lock:
+            card = self._cards.get(agent_id)
+            return card.name if card else "Unknown"
+
+    async def register(self, agent_id: str, card: AgentCard):
+        async with self._lock:
+            self._cards[agent_id] = card
+            if agent_id not in self._statuses:
+                self._statuses[agent_id] = AgentStatus.AVAILABLE
+                self._busy_slots[agent_id] = 0
+
+    async def update_status(
+        self,
+        agent_id: str,
+        status: AgentStatus,
+        broken_reason: BrokenReason | None = None,
+        stuck_task_id: str | None = None,
+    ):
+        async with self._lock:
+            if agent_id not in self._cards:
+                return
+            if status == AgentStatus.BUSY:
+                # Increment slot count; status is always BUSY when any slot is occupied.
+                self._busy_slots[agent_id] = self._busy_slots.get(agent_id, 0) + 1
+                self._statuses[agent_id] = AgentStatus.BUSY
+            elif status == AgentStatus.AVAILABLE:
+                # Decrement slot count; status returns to AVAILABLE only when all slots free.
+                slots = max(0, self._busy_slots.get(agent_id, 0) - 1)
+                self._busy_slots[agent_id] = slots
+                if slots == 0:
+                    self._statuses[agent_id] = AgentStatus.AVAILABLE
+                    self._broken_reasons.pop(agent_id, None)
+                    self._stuck_task_ids.pop(agent_id, None)
+                    self._current_tasks.pop(agent_id, None)
+            elif status == AgentStatus.BROKEN:
+                self._statuses[agent_id] = AgentStatus.BROKEN
+                if broken_reason:
+                    self._broken_reasons[agent_id] = broken_reason
+                    if stuck_task_id:
+                        self._stuck_task_ids[agent_id] = stuck_task_id
+
+    async def set_current_task(self, agent_id: str, task_id: str | None):
+        """Add or remove a task from the agent's running task list."""
+        async with self._lock:
+            if task_id:
+                if agent_id not in self._current_tasks:
+                    self._current_tasks[agent_id] = []
+                self._current_tasks[agent_id].append(task_id)
+            else:
+                self._current_tasks.pop(agent_id, None)
+
+    async def get_current_task(self, agent_id: str) -> str | None:
+        """Get the most recently started task for this agent (for backward-compatible display)."""
+        async with self._lock:
+            tasks = self._current_tasks.get(agent_id)
+            return tasks[-1] if tasks else None
+
+    async def get_current_tasks(self, agent_id: str) -> list[str]:
+        """Get all currently running task IDs for this agent."""
+        async with self._lock:
+            return list(self._current_tasks.get(agent_id, []))
+
+    async def get_status(self, agent_id: str) -> AgentStatus:
+        async with self._lock:
+            return self._statuses.get(agent_id, AgentStatus.BROKEN)
+
+    async def get_broken_context(self, agent_id: str) -> tuple[BrokenReason | None, str | None]:
+        """Get the reason and stuck task ID for a broken agent."""
+        async with self._lock:
+            reason = self._broken_reasons.get(agent_id)
+            task_id = self._stuck_task_ids.get(agent_id)
+            return reason, task_id
+
+    async def remove(self, agent_id: str):
+        async with self._lock:
+            self._cards.pop(agent_id, None)
+            self._statuses.pop(agent_id, None)
+            self._broken_reasons.pop(agent_id, None)
+            self._stuck_task_ids.pop(agent_id, None)
+            self._current_tasks.pop(agent_id, None)
+            self._busy_slots.pop(agent_id, None)
+
+    async def get_all_cards(self) -> dict[str, AgentCard]:
+        async with self._lock:
+            return self._cards.copy()
+
+    async def is_empty(self) -> bool:
+        async with self._lock:
+            return not self._cards
+
+    async def contains(self, agent_id: str) -> bool:
+        async with self._lock:
+            return agent_id in self._cards
+
+    async def get_valid_agents(self) -> list[str]:
+        async with self._lock:
+            return [
+                aid for aid, status in self._statuses.items() if status != AgentStatus.BROKEN and aid in self._cards
+            ]
+
+    async def get_available_agents(self) -> list[str]:
+        """Get agents that have at least one free slot for a new task (not BROKEN and below MAX_SLOTS)."""
+        from config import OrchestratorConfig
+
+        max_slots = OrchestratorConfig.MAX_SLOTS_PER_AGENT
+        async with self._lock:
+            return [
+                aid
+                for aid, status in self._statuses.items()
+                if status != AgentStatus.BROKEN
+                and aid in self._cards
+                and self._busy_slots.get(aid, 0) < max_slots
+            ]
+
+    async def get_agent_id_by_url(self, url: str) -> str | None:
+        async with self._lock:
+            for agent_id, card in self._cards.items():
+                if card.supported_interfaces and card.supported_interfaces[0].url == url:
+                    return agent_id
+            return None
+
+    async def get_broken_agents(self) -> dict[str, tuple[BrokenReason | None, str | None]]:
+        async with self._lock:
+            result = {}
+            for agent_id, status in self._statuses.items():
+                if status == AgentStatus.BROKEN:
+                    reason = self._broken_reasons.get(agent_id)
+                    task_id = self._stuck_task_ids.get(agent_id)
+                    result[agent_id] = (reason, task_id)
+            return result
+
+
+# Global instances - initialized once at module load
+ORCHESTRATOR_START_TIME = datetime.now()
+agent_registry = AgentRegistry()
+task_history = TaskHistory(max_size=10000)
+error_history = ErrorHistory(max_size=50)

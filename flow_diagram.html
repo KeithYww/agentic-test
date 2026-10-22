@@ -1,0 +1,143 @@
+<!--
+SPDX-FileCopyrightText: 2025-2026 Taras Paruta (partarstu@gmail.com)
+
+SPDX-License-Identifier: AGPL-3.0-only
+-->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>QuAIA - Orchestration Flow Diagram</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f3f4f6;
+        }
+        .mermaid {
+            width: 100%;
+            height: auto;
+        }
+        /* Mermaid Theme Customization */
+        .cluster {
+            fill: #f9fafb;
+            stroke: #9ca3af;
+            stroke-width: 2px;
+            rx: 8px;
+        }
+        .node rect, .node circle, .node ellipse, .node polygon, .node path {
+            fill: #e5e7eb;
+            stroke: #6b7280;
+            stroke-width: 2px;
+        }
+        .node .label {
+            font-family: 'Inter', sans-serif;
+            font-weight: 600;
+            color: #1f2937;
+        }
+        .edgePath .path {
+            stroke: #4b5563;
+            stroke-width: 2px;
+        }
+        .arrowhead {
+            fill: #4b5563;
+        }
+        .cluster-title .label {
+            font-size: 1.25rem;
+            font-weight: 700;
+            fill: #111827;
+        }
+    </style>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+</head>
+<body class="bg-gray-100 p-4 sm:p-6 md:p-8">
+    <div class="max-w-7xl mx-auto bg-white rounded-xl shadow-lg p-6">
+        <h4 class="text-1xl sm:text-2xl font-bold text-gray-800 mb-2 text-center">QuAIA Orchestration Flow</h4>
+
+        <!-- Mermaid Diagram Container -->
+        <div class="mermaid-container overflow-x-auto">
+            <div class="mermaid">
+graph TD
+    subgraph "Workflow 4: RAG Database Update"
+        RAG1[API call<br>/update-rag-db] --> RAG2[Orchestrator reads project<br>issues via Jira REST API];
+        RAG2 --> RAG3[Sync issues<br>to Vector DB];
+        RAG3 --> RAG4[Return update summary];
+        RAG4 --> RAG5((End));
+    end
+
+    subgraph "Workflow 3: Test Execution and Reporting"
+        TE1[API call /execute-tests] --> TE2[Fetch TCs which are ready for automated execution];
+        TE2 --> TE3["Group TCs by type (UI, API etc.)"];
+        TE3 --> TE4[Distribute each test type to dedicated execution agents swarm];
+        TE4 --> TE7[Each agent swarm executes tests];
+        TE7 --> TE8[Gather execution results];
+        TE8 --> TE9{"Any failed tests?"};
+        TE9 -- Yes --> TE11[Delegate handling incidents to the dedicated agents];
+        TE9 -- No --> TE16[Create test execution results in Test Mgmt System];
+        TE11 --> TE13[Each agent identifies if<br>the incident is already reported];
+        TE13 -- Yes --> TE14[Each agent returns existing<br>incident report IDs/Keys];
+        TE13 -- No --> TE15[Each agent creates an incident report<br>in Test Mgmt System with all attachments];
+        TE14 --> TE16;
+        TE15 --> TE16;
+        TE16 --> TE17[Generate Allure reports];
+        TE17 --> TE18((End));
+    end
+
+    subgraph "Workflow 2: Test Case Generation, Classification and Review"
+        TCG1[Webhook<br>/story-ready-for-test-case-generation] --> TCG2[Extract user story ID];
+        TCG2 --> TCG3[Select agent for<br>'Generate test cases'];
+        TCG3 --> TCG4[Send generation task];
+        TCG4 --> TCG5[Wait and receive generated TCs];
+        TCG5 --> TCG6[Select agent for<br>'Classify test cases'];
+        TCG6 --> TCG7[Send classification task];
+        TCG7 --> TCG8[Wait for classification completion];
+        TCG8 --> TCG9[Select agent for<br>'Review test cases'];
+        TCG9 --> TCG10[Send review task];
+        TCG10 --> TCG11[Wait for review completion];
+        TCG11 --> TCG12((End));
+    end
+
+    subgraph "Workflow 1: Requirements Review"
+        RR1[Webhook<br>/new-requirements-available] --> RR2[Extract user story ID];
+        RR2 --> RR3[Select agent for<br>'Review user story'];
+        RR3 --> RR4[Send review task<br>to agent];
+        RR4 --> RR5[Wait for task completion];
+        RR5 --> RR6((End));
+    end
+
+    subgraph "System Startup and Agent Discovery"
+        A[Orchestrator starts] --> B[Initial agent discovery];
+        B --> C[Scan configured agent URLs];
+        C --> D{Fetch agent cards};
+        D -- Success --> E[Add/update agent in registry<br>Status: AVAILABLE];
+        D -- Failure --> F[Mark agent as BROKEN<br>Reason: OFFLINE];
+        E --> G{Periodic discovery loop};
+        F --> G;
+        G --> C;
+    end
+            </div>
+        </div>
+    </div>
+
+    <!-- Mermaid JS Library -->
+    <script type="module">
+        import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'base',
+            themeVariables: {
+                primaryColor: '#f9fafb',
+                primaryTextColor: '#1f2937',
+                primaryBorderColor: '#9ca3af',
+                lineColor: '#4b5563',
+                secondaryColor: '#e5e7eb',
+                tertiaryColor: '#d1d5db'
+            }
+        });
+    </script>
+</body>
+</html>

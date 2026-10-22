@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "agentic-qa.fullname" . }}-config
+  labels:
+    {{- include "agentic-qa.labels" . | nindent 4 }}
+data:
+  DASHBOARD_PUBLIC_URL: {{ .Values.config.dashboard_public_url | quote }}
+  MEEGO_PROJECT_KEY: {{ .Values.config.meego_project_key | quote }}
+  PHOTON_API_BASE_URL: {{ .Values.config.photon_api_base_url | quote }}
+  PROMPT_INJECTION_CHECK_ENABLED: {{ .Values.config.prompt_injection_check_enabled | quote }}
+  LOG_LEVEL: {{ .Values.config.log_level | quote }}
+  FEISHU_MCP_SERVER_URL: {{ .Values.config.feishu_mcp_server_url | quote }}
+  REMOTE_EXECUTION_AGENT_HOSTS: {{ .Values.config.remote_execution_agent_hosts | quote }}
+  AGENT_DISCOVERY_PORTS: {{ .Values.config.agent_discovery_ports | quote }}
+  OTEL_EXPORTER_OTLP_ENDPOINT: {{ .Values.config.otel_exporter_otlp_endpoint | quote }}
+  REQUIREMENT_REVIEW_ENABLED: {{ .Values.config.requirement_review_enabled | quote }}
+  TC_REPAIR_MAX_TOKENS: {{ .Values.config.tc_repair_max_tokens | quote }}
+  OSS_ARCHIVE_ENABLED: {{ .Values.config.oss_archive_enabled | quote }}
+  OSS_ENDPOINT: {{ .Values.config.oss_endpoint | quote }}
+  OSS_BUCKET: {{ .Values.config.oss_bucket | quote }}
+  OSS_REGION: {{ .Values.config.oss_region | quote }}
+  KB_BASE_URL: {{ .Values.config.kb_base_url | quote }}
+  KB_QUERY_ENABLED: {{ .Values.config.kb_query_enabled | quote }}
+  DESIGN_MAX_REVIEWS: {{ .Values.config.design_max_reviews | quote }}
+  DESIGN_FIX_MIN_SEVERITY: {{ .Values.config.design_fix_min_severity | quote }}
+  DESIGN_TIMEOUT_SECONDS: {{ .Values.config.design_timeout_seconds | quote }}
+  DESIGN_TOKEN_LIMIT: {{ .Values.config.design_token_limit | quote }}
+  DESIGN_MODEL_CONCURRENCY: {{ .Values.config.design_model_concurrency | quote }}
+  DESIGN_CONTEXT_WINDOW: {{ .Values.config.design_context_window | quote }}

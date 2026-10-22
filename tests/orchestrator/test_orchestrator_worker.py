@@ -1,0 +1,165 @@
+# SPDX-FileCopyrightText: 2025-2026 Taras Paruta (partarstu@gmail.com)
+#
+# SPDX-License-Identifier: AGPL-3.0-only
+
+import asyncio
+import contextlib
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from a2a.types import TaskState
+
+from common.models import TestCase, TestExecutionResult
+from orchestrator.main import AgentStatus, BrokenReason, _agent_worker, _execute_single_test
+
+
+@pytest.fixture
+def mock_registry():
+    with patch("orchestrator.main.agent_registry") as mock:
+        mock.get_name = AsyncMock(return_value="Agent 1")
+        mock.get_status = AsyncMock(return_value=AgentStatus.AVAILABLE)
+        yield mock
+
+
+@pytest.fixture
+def mock_queue():
+    queue = MagicMock()
+    queue.get = AsyncMock()
+    queue.task_done = MagicMock()
+    queue.put_nowait = MagicMock()
+    return queue
+
+
+@pytest.mark.asyncio
+async def test_agent_worker_success(mock_registry, mock_queue):
+    mock_registry.get_status.side_effect = [AgentStatus.AVAILABLE, AgentStatus.AVAILABLE]
+
+    test_case = TestCase(
+        key="TC-1",
+        summary="Sum",
+        name="Name",
+        steps=[],
+        test_data=[],
+        expected_results=[],
+        labels=[],
+        comment="",
+        preconditions="",
+        parent_issue_key="STORY-1",
+    )
+    mock_queue.get.side_effect = [(test_case, "UI"), asyncio.CancelledError]
+
+    with patch("orchestrator.main._execute_single_test", new_callable=AsyncMock) as mock_exec:
+        mock_exec.return_value = TestExecutionResult(
+            stepResults=[],
+            testCaseKey="TC-1",
+            testCaseName="Name",
+            testExecutionStatus="passed",
+            generalErrorMessage="",
+            start_timestamp="now",
+            end_timestamp="then",
+        )
+
+        results = []
+        with contextlib.suppress(asyncio.CancelledError):
+            await _agent_worker("agent-1", mock_queue, results, ["agent-1"])
+
+        assert len(results) == 1
+        mock_exec.assert_called_once()
+        mock_registry.get_status.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_agent_worker_broken(mock_registry, mock_queue):
+    mock_registry.get_status.return_value = AgentStatus.BROKEN
+    results = []
+    await _agent_worker("agent-1", mock_queue, results, ["agent-1"])
+    assert len(results) == 0
+
+
+@pytest.mark.asyncio
+async def test_agent_worker_enqueues_recovery_when_task_fails(mock_registry, mock_queue):
+    test_case = TestCase(
+        key="TC-1",
+        summary="Sum",
+        name="Name",
+        steps=[],
+        test_data=[],
+        expected_results=[],
+        labels=[],
+        comment="",
+        preconditions="",
+        parent_issue_key="STORY-1",
+    )
+    mock_queue.get.side_effect = [(test_case, "UI")]
+    mock_registry.update_status = AsyncMock()
+
+    with (
+        patch("orchestrator.main._execute_single_test", new_callable=AsyncMock) as mock_exec,
+        patch("orchestrator.main.cancellation_queue") as mock_cancellation_queue,
+    ):
+        mock_exec.side_effect = RuntimeError("iterator finished before completion")
+        mock_cancellation_queue.put = AsyncMock()
+
+        results = []
+        await _agent_worker("agent-1", mock_queue, results, ["agent-1"])
+
+        mock_registry.update_status.assert_awaited_with(
+            "agent-1", AgentStatus.BROKEN, BrokenReason.TASK_STUCK
+        )
+        mock_cancellation_queue.put.assert_awaited_once()
+        enqueued_agent_id, _ = mock_cancellation_queue.put.await_args.args[0]
+        assert enqueued_agent_id == "agent-1"
+
+
+@pytest.mark.asyncio
+async def test_execute_single_test_success(mock_registry):
+    test_case = TestCase(
+        key="TC-1",
+        summary="Sum",
+        name="Name",
+        steps=[],
+        test_data=[],
+        expected_results=[],
+        labels=[],
+        comment="",
+        preconditions="",
+        parent_issue_key="STORY-1",
+    )
+
+    mock_task = MagicMock()
+    mock_task.status.state = TaskState.TASK_STATE_COMPLETED
+
+    mock_part = MagicMock()
+    mock_part.HasField.side_effect = lambda field: field == "text"
+    mock_part.text = '{"testExecutionStatus": "passed"}'
+    mock_artifact = MagicMock()
+    mock_artifact.parts = [mock_part]
+    mock_task.artifacts = [mock_artifact]
+
+    mock_registry.get_name.return_value = "Agent 1"
+
+    with (
+        patch("orchestrator.main._send_task_to_agent", new_callable=AsyncMock) as mock_send,
+        patch("orchestrator.main._get_results_extractor_agent") as mock_extractor_agent_cls,
+    ):
+        mock_send.return_value = (mock_task, "test-internal-task-id")
+
+        mock_extractor_instance = MagicMock()
+        mock_extractor_agent_cls.return_value = mock_extractor_instance
+
+        mock_run_result = MagicMock()
+        mock_run_result.output = TestExecutionResult(
+            stepResults=[],
+            testCaseKey="TC-1",
+            testCaseName="Name",
+            testExecutionStatus="passed",
+            generalErrorMessage="",
+            start_timestamp="now",
+            end_timestamp="then",
+        )
+        mock_extractor_instance.run = AsyncMock(return_value=mock_run_result)
+
+        result = await _execute_single_test("agent-1", test_case, "UI")
+
+        assert result.testExecutionStatus == "passed"
+        assert result.testCaseKey == "TC-1"

@@ -1,0 +1,129 @@
+# SPDX-FileCopyrightText: 2025-2026 Taras Paruta (partarstu@gmail.com)
+#
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# Self-hosted Langfuse instance (OpenTelemetry/LLM observability backend), independent of the
+# application's own services and of the `docker-compose.smoke.yml` hermetic test stack. Run it
+# standalone wherever you want the application's OTLP traces to land:
+#
+#   docker compose -f docker-compose.langfuse.yml up -d
+#
+# First run: open http://localhost:3000, sign up, create an organization/project, and generate
+# a public/secret API key pair in its settings. Then, in the application's own `.env`, set:
+#
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:3000/api/public/otel
+#   OTEL_EXPORTER_OTLP_HEADERS=Authorization=Basic <base64(public_key:secret_key)>
+#
+# No application code or dependency talks to Langfuse directly — the app only ever speaks
+# plain OpenTelemetry OTLP/HTTP (see common/observability.py), so this stack can be replaced
+# with any other OTLP-compatible backend (Tempo, Phoenix, ...) without touching application code.
+#
+# Secrets below are placeholders for local/self-hosted use — override via a `.env.langfuse`
+# file (same directory, picked up automatically by Docker Compose) before any shared/production use.
+
+services:
+  langfuse-postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: "${LANGFUSE_POSTGRES_USER:-langfuse}"
+      POSTGRES_PASSWORD: "${LANGFUSE_POSTGRES_PASSWORD:-change-me-in-production}"
+      POSTGRES_DB: "${LANGFUSE_POSTGRES_DB:-langfuse}"
+    volumes:
+      - langfuse_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${LANGFUSE_POSTGRES_USER:-langfuse}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  langfuse-clickhouse:
+    image: clickhouse/clickhouse-server:24
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_USER: "${LANGFUSE_CLICKHOUSE_USER:-langfuse}"
+      CLICKHOUSE_PASSWORD: "${LANGFUSE_CLICKHOUSE_PASSWORD:-change-me-in-production}"
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  langfuse-redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${LANGFUSE_REDIS_PASSWORD:-change-me-in-production}"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${LANGFUSE_REDIS_PASSWORD:-change-me-in-production}", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  langfuse-minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    entrypoint: ["sh", "-c", "mkdir -p /data/langfuse && minio server /data --address ':9000' --console-address ':9001'"]
+    environment:
+      MINIO_ROOT_USER: "${LANGFUSE_S3_ACCESS_KEY:-langfuse}"
+      MINIO_ROOT_PASSWORD: "${LANGFUSE_S3_SECRET_KEY:-change-me-in-production}"
+    volumes:
+      - langfuse_minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  langfuse-worker:
+    image: langfuse/langfuse-worker:3
+    restart: unless-stopped
+    depends_on:
+      langfuse-postgres:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+      langfuse-minio:
+        condition: service_healthy
+    environment: &langfuse-env
+      DATABASE_URL: "postgresql://${LANGFUSE_POSTGRES_USER:-langfuse}:${LANGFUSE_POSTGRES_PASSWORD:-change-me-in-production}@langfuse-postgres:5432/${LANGFUSE_POSTGRES_DB:-langfuse}"
+      CLICKHOUSE_URL: "http://langfuse-clickhouse:8123"
+      CLICKHOUSE_USER: "${LANGFUSE_CLICKHOUSE_USER:-langfuse}"
+      CLICKHOUSE_PASSWORD: "${LANGFUSE_CLICKHOUSE_PASSWORD:-change-me-in-production}"
+      REDIS_CONNECTION_STRING: "redis://:${LANGFUSE_REDIS_PASSWORD:-change-me-in-production}@langfuse-redis:6379"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: "langfuse"
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: "auto"
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: "http://langfuse-minio:9000"
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: "${LANGFUSE_S3_ACCESS_KEY:-langfuse}"
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: "${LANGFUSE_S3_SECRET_KEY:-change-me-in-production}"
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      SALT: "${LANGFUSE_SALT:-change-me-in-production}"
+      ENCRYPTION_KEY: "${LANGFUSE_ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000}"
+      TELEMETRY_ENABLED: "false"
+
+  langfuse-web:
+    image: langfuse/langfuse:3
+    restart: unless-stopped
+    depends_on:
+      langfuse-worker:
+        condition: service_started
+    environment:
+      <<: *langfuse-env
+      NEXTAUTH_URL: "${LANGFUSE_BASE_URL:-http://localhost:3000}"
+      NEXTAUTH_SECRET: "${LANGFUSE_NEXTAUTH_SECRET:-change-me-in-production}"
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/api/public/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+volumes:
+  langfuse_postgres_data:
+  langfuse_clickhouse_data:
+  langfuse_minio_data:

@@ -1,0 +1,219 @@
+# SPDX-FileCopyrightText: 2025-2026 Taras Paruta (partarstu@gmail.com)
+#
+# SPDX-License-Identifier: AGPL-3.0-only
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.11.21"
+          enable-cache: true
+
+      - name: Install dev tooling
+        run: uv sync --frozen --only-group dev
+
+      - name: Run ruff linter
+        run: uv run ruff check . --output-format=github
+
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.14"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.11.21"
+          enable-cache: true
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libmagic1
+
+      - name: Install dependencies
+        run: uv sync --frozen --python ${{ matrix.python-version }}
+
+      - name: Run tests with coverage
+        run: |
+          uv run pytest tests/ \
+            -m "not smoke" \
+            --cov=. \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            --junitxml=test-results.xml \
+            -v
+
+      - name: Upload coverage report
+        uses: codecov/codecov-action@v4
+        if: matrix.python-version == '3.14'
+        with:
+          files: ./coverage.xml
+          fail_ci_if_error: false
+          verbose: true
+        continue-on-error: true
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-${{ matrix.python-version }}
+          path: |
+            test-results.xml
+            coverage.xml
+          retention-days: 30
+
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.11.21"
+          enable-cache: true
+
+      - name: Install dev tooling
+        run: uv sync --frozen --only-group dev
+
+      - name: Run bandit security scan
+        run: uv run bandit -r . -x ./tests,./orchestrator/ui,./.venv -f json -o bandit-report.json || true
+
+      - name: Upload bandit report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bandit-security-report
+          path: bandit-report.json
+          retention-days: 30
+
+  dependency-check:
+    name: Dependency Vulnerability Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.11.21"
+          enable-cache: true
+
+      - name: Run uv audit
+        run: uv audit --preview-features audit-command --frozen --no-dev || true
+        continue-on-error: true
+
+  architecture:
+    name: Architecture (CALM)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Validate architecture against CALM pattern
+        working-directory: calm
+        run: >-
+          npx -y @finos/calm-cli@1.46.0 validate
+          -p patterns/quaia.pattern.json
+          -a architecture/quaia.arch.json
+          -u url-mapping.json
+          --strict
+          -f pretty
+
+  smoke:
+    name: Smoke (hermetic, real LLM)
+    runs-on: ubuntu-latest
+    # Real, billed model calls require a maintainer's explicitly configured endpoint and secret.
+    if: github.event_name == 'workflow_dispatch'
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.11.21"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # The base image carries all locked dependencies, so caching it saves the
+      # bulk of the cold-build time; the compose images derive from it and only
+      # copy code on top.
+      - name: Build base image (GHA-cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.base
+          tags: agentic-qa-base:latest
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The compose build below must see the base image via the local daemon's
+      # image store, which the docker-container builder above does not share.
+      - name: Switch back to the default builder
+        run: docker buildx use default
+
+      - name: Start the smoke topology
+        env:
+          PHOTON_API_KEY: ${{ secrets.PHOTON_API_KEY }}
+          PHOTON_API_BASE_URL: ${{ vars.PHOTON_API_BASE_URL }}
+          COMPOSE_BAKE: "false"
+        run: docker compose -f docker-compose.smoke.yml up -d --build --wait
+
+      - name: Run smoke tests
+        run: uv run pytest tests/smoke -m smoke -v
+
+      - name: Dump compose logs
+        if: always()
+        run: docker compose -f docker-compose.smoke.yml logs --no-color
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.smoke.yml down -v

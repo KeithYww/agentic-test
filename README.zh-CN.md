@@ -1,0 +1,46 @@
+# Agentic Test
+
+将需求转成可评审测试用例的 QA Agent 框架，支持持久化任务、有界修复和人工交接。
+
+本项目基于 Taras Paruta 的 [QuAIA / agentic-qa-framework](https://github.com/partarstu/agentic-qa-framework) 独立维护，保留原作者署名及 `AGPL-3.0-only` 许可。修改说明见 [PUBLICATION.md](PUBLICATION.md)，完整启动步骤见 [英文 README](README.md)。
+
+## 包含的能力
+
+- 从需求提取测试范围，生成结构化用例，进行逐例和整套评审、定向修复与分类。
+- 通过 SQLite 检查点恢复任务，限制模型尝试、token 预算和并发。
+- 提供 Agent 通信、看板、任务进度与脱敏追踪。
+- 通过飞书读取需求、发布多维表格并回写 Meego 节点；同时保留其他测试管理适配器。
+- 保留单元测试、外部边界 mock、Docker 构建文件和 CALM 架构校验。
+
+## 接入边界
+
+当前是需要自行接入服务的框架版本，尚未验证面向公网服务的完整部署。已知依赖与静态扫描风险见 [SECURITY.md](SECURITY.md)。仓库不包含内部环境地址、凭据、真实需求与原私有提交历史。
+
+1. **模型服务**：使用 Anthropic 兼容协议。为兼容现有代码保留 `PHOTON_*` 变量名；模型别名须按自己的服务配置，不能假设默认别名在公开模型服务上可用。未知失败不会自动按确定未计费处理。
+2. **知识库**：需要实现 README 中约定的查询接口。成功但答案为空会继续生成；禁用或不可用会阻断持久化生成流程，不能简单关闭后运行。边界 mock 仅用于测试。
+3. **飞书权限**：需配置自己的应用、`lark-cli` 机器人身份和文档、表格权限。**生成表格默认允许本租户内持链接的人编辑**，使用前应核对这一权限范围。
+4. **Meego 模板**：需配置自己的项目、节点和字段 ID，仓库中的默认标识均为示例。
+
+需求评审和 OSS 归档默认关闭。达到评审轮次上限后交人工处理剩余意见，任务完成不表示所有质量问题通过。提示词注入检测默认关闭，不可信资料处理规则也不能保证阻断所有攻击。
+
+## 本地准备
+
+需要 Python 3.14、uv；UI 和 CALM 需要 Node.js 20+；飞书读取、发布还需要 `lark-cli`。
+
+```bash
+uv sync --frozen
+cp .env.example .env
+# 填入自己的模型、知识库、飞书和认证配置。
+uv run python -m scripts.start_all
+```
+
+看板端口为 8000。持久化任务需要配置可写的 `DESIGN_STATE_DIR` 并在重启时复用该目录，按单实例运行。Docker 构建、持久卷挂载与校验命令见英文 README。Helm 是高级部署模板，不能在未配置持久卷时宣称支持恢复。
+
+普通单元测试无需真实服务，真实模型 smoke 仅手动触发并产生费用。
+
+```bash
+uv run ruff check .
+uv run pytest tests/ -m 'not smoke and not live_llm'
+```
+
+遵循 [AGPL-3.0-only](LICENSE)。本地模型权重未随源码分发，需分别遵守其许可。

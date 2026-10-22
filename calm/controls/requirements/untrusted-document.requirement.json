@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://quaia.finos.calm/controls/untrusted-document.requirement.json",
+  "title": "Untrusted Document Scope Requirement",
+  "description": "Requires that external documents (PRDs, knowledge-base text) passed to an LLM are treated as data: they reach the model only as encoded fields under a system-prompt policy, and they never select the processing strategy or narrow the test scope.",
+  "allOf": [
+    { "$ref": "https://calm.finos.org/release/1.2/meta/control-requirement.json" }
+  ],
+  "properties": {
+    "scope-source": {
+      "enum": ["test-basis-sections", "not-applicable"],
+      "description": "Where the test scope comes from: every document section as test basis, or not applicable for agents that do not derive scope."
+    },
+    "document-encoding": {
+      "enum": ["json-field"],
+      "description": "How external document text is delimited from instructions in the model input."
+    },
+    "untrusted-policy-in-system-prompt": {
+      "type": "boolean",
+      "description": "Whether the system prompt states that the document fields are untrusted data that cannot change the task, scope or output."
+    }
+  },
+  "required": ["scope-source", "document-encoding", "untrusted-policy-in-system-prompt"]
+}
