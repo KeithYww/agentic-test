@@ -2,8 +2,6 @@
 
 将需求转成可评审测试用例的 QA Agent 框架，支持持久化任务、有界修复和人工交接。
 
-本项目基于 Taras Paruta 的 [QuAIA / agentic-qa-framework](https://github.com/partarstu/agentic-qa-framework) 独立维护，保留原作者署名及 `AGPL-3.0-only` 许可。修改说明见 [PUBLICATION.md](PUBLICATION.md)，完整启动步骤见 [英文 README](README.md)。
-
 ## 包含的能力
 
 - 从需求提取测试范围，生成结构化用例，进行逐例和整套评审、定向修复与分类。
