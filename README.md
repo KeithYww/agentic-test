@@ -10,6 +10,55 @@
 - 通过飞书读取需求、发布多维表格并回写 Meego 节点；同时保留其他测试管理适配器。
 - 保留单元测试、外部边界 mock、Docker 构建文件和 CALM 架构校验。
 
+```mermaid
+flowchart TB
+    User["QA engineer"] --> UI["Web dashboard"]
+    Project["Feishu Project / Meego"] <-->|"Requirement event / node writeback"| Orchestrator
+
+    subgraph Runtime ["Default deployment: one process / one event loop"]
+        UI -->|"REST / SSE"| Orchestrator["Orchestrator :8000"]
+        Orchestrator --> Generation["Generation and repair agent :8002"]
+        Orchestrator --> Review["Review agent :8004"]
+        Orchestrator --> Classification["Classification agent :8003"]
+        Orchestrator --> Reader["Feishu document adapter"]
+        Orchestrator --> Publisher["Bitable publishing adapter"]
+        Orchestrator --> Store[("SQLite durable state")]
+        MCP["Feishu MCP :9010"] --> Reader
+        Generation -.->|"Compatibility tool entry"| MCP
+    end
+
+    Reader --> PRD["Feishu requirements and embedded tables"]
+    Publisher --> Bitable["Feishu Bitable"]
+    Generation --> KB["Knowledge query service"]
+    Generation --> LLM["Anthropic-compatible model endpoint"]
+    Review --> LLM
+    Classification --> LLM
+```
+
+```mermaid
+flowchart TB
+    Trigger["Requirement event from Feishu Project"] --> Read["Read complete requirements and embedded tables"]
+    Read --> Knowledge["Query and checkpoint knowledge snapshot"]
+    Knowledge --> Available{"Knowledge query succeeded?"}
+    Available -->|"Answer or successful empty result"| Generate["Extract requirements from every section and draft cases"]
+    Available -->|"Disabled or unavailable"| Pause["Pause with checkpoints when persistence is enabled"]
+    Generate --> CaseReview["Case review"]
+    CaseReview --> SuiteReview["Suite review: coverage gaps and duplication"]
+    SuiteReview --> Continue{"More repairs needed and allowed?"}
+    Continue -->|"Yes: up to 2 repair rounds"| Fix["Apply targeted repairs and save revision"]
+    Fix --> CaseReview
+    Continue -->|"No: converged or handoff condition reached"| Classify["Classify final reviewed cases"]
+    Classify --> Publish["Create Bitable with cases and remaining findings"]
+    Publish --> Complete{"Records, comments and access complete?"}
+    Complete -->|"No"| Pause
+    Complete -->|"Yes"| Writeback["Write back table URL, complete and confirm AI node"]
+    Writeback --> Human["Hand off to human review and send completion notice"]
+    Read -.->|"Read failure"| Pause
+    Writeback -.->|"Writeback failure"| Pause
+    Pause --> Confirm["Sign in and confirm eligible resume"]
+    Confirm --> Resume["Reuse checkpoints within original budget and deadline"]
+```
+
 ## 接入边界
 
 当前是需要自行接入服务的框架版本，尚未验证面向公网服务的完整部署。已知依赖与静态扫描风险见 [SECURITY.md](SECURITY.md)。仓库不包含内部环境地址、凭据、真实需求与原私有提交历史。
